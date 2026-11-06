@@ -1,0 +1,237 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ORDER SERVICE: the flagship module. Each dependency below is a Spring Boot STARTER: one coordinate that
+  brings a curated set of libraries AND the auto-configuration that wires them together when present on
+  the classpath.
+
+  SPRING BOOT 4 CHANGE: the old monolithic spring-boot-autoconfigure jar was split into focused modules
+  (spring-boot-webmvc, spring-boot-data-jpa, spring-boot-kafka...). Starters were renamed to match:
+    spring-boot-starter-web   -> spring-boot-starter-webmvc
+    spring-boot-starter-aop   -> spring-boot-starter-aspectj
+    oauth2 starters           -> spring-boot-starter-security-oauth2-*
+  and EVERY technology now has its own TEST starter (spring-boot-starter-webmvc-test...), which brings
+  only the test slices you use. Flyway now needs spring-boot-starter-flyway (flyway-core alone is no
+  longer auto-configured).
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.showcase</groupId>
+        <artifactId>spring-boot-showcase</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>order-service</artifactId>
+    <name>order-service</name>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.showcase</groupId>
+            <artifactId>contracts</artifactId>
+        </dependency>
+
+        <!-- ============ Web: REST (MVC on virtual threads), validation, OpenAPI ============ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>   <!-- /swagger-ui.html -->
+        </dependency>
+        <dependency>
+            <!-- Boot 4 modularization: RestClient + HTTP service client (@ImportHttpServices group properties)
+                 auto-configuration lives in its own module. The webmvc starter (SERVER side) doesn't include it. -->
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-restclient</artifactId>
+        </dependency>
+
+        <!-- ============ GraphQL (Spring for GraphQL 2.0) ============ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-graphql</artifactId>
+        </dependency>
+
+        <!-- ============ Data: JPA (Hibernate 7) + PostgreSQL + Flyway migrations ============ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-flyway</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>   <!-- Flyway 10+ ships database support as plugins -->
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>      <!-- only the JDBC driver; code depends on JDBC/JPA APIs -->
+        </dependency>
+
+        <!-- ============ Caching + idempotency keys: Redis ============ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-cache</artifactId>
+        </dependency>
+
+        <!-- ============ Messaging: Kafka (events) + RabbitMQ (commands) ============ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-kafka</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
+
+        <!-- ============ Service-to-service: gRPC client (auto-configured since Boot 4.1) ============ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-grpc-client</artifactId>
+        </dependency>
+
+        <!-- ============ Resilience ============
+             Spring Framework 7 has @Retryable / @ConcurrencyLimit built in (no extra dependency).
+             Circuit breakers come from Resilience4j through Spring Cloud CircuitBreaker, an
+             implementation-neutral API, so Resilience4j could be swapped out. -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-circuitbreaker-resilience4j</artifactId>
+        </dependency>
+
+        <!-- ============ Security: OAuth2 resource server (JWT) + method security ============ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security-oauth2-resource-server</artifactId>
+        </dependency>
+
+        <!-- ============ Production readiness + observability ============ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <!-- Boot 4: first-class OpenTelemetry (traces + metrics + logs over OTLP) -->
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-opentelemetry</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>    <!-- /actuator/prometheus scrape endpoint -->
+        </dependency>
+        <dependency>
+            <!-- AspectJ weaving support for @Observed and other annotation-driven aspects -->
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aspectj</artifactId>
+        </dependency>
+
+        <!-- ============ Developer experience ============ -->
+        <dependency>
+            <!-- On "spring-boot:run" / IDE start: runs docker compose up for ../docker-compose.yml and creates
+                 the connection details (DB URL, Kafka bootstrap...) from the running containers.
+                 Ignored in packaged jars and in tests. -->
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-docker-compose</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <!-- Generates metadata for @ConfigurationProperties: IDE autocompletion + docs for application.yml -->
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- ================================ TESTS ================================ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>     <!-- JUnit 5, AssertJ, Mockito, Awaitility, JSONassert -->
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc-test</artifactId>    <!-- @WebMvcTest, MockMvcTester -->
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa-test</artifactId>  <!-- @DataJpaTest -->
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security-test</artifactId>  <!-- jwt() request post-processor, @WithMockUser -->
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-graphql-test</artifactId>   <!-- @GraphQlTest, GraphQlTester -->
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-testcontainers</artifactId>          <!-- @ServiceConnection -->
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-junit-jupiter</artifactId>        <!-- Testcontainers 2.x artifact names -->
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-rabbitmq</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.tngtech.archunit</groupId>
+            <artifactId>archunit-junit5</artifactId>                     <!-- architecture rules as unit tests -->
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <!-- Git commit/branch in /actuator/info: "which build is running in prod?" answered instantly -->
+                <groupId>io.github.git-commit-id</groupId>
+                <artifactId>git-commit-id-maven-plugin</artifactId>
+                <configuration>
+                    <failOnNoGitDirectory>false</failOnNoGitDirectory>
+                </configuration>
+            </plugin>
+            <plugin>
+                <!-- CycloneDX SBOM; Boot serves it at /actuator/sbom (supply-chain transparency) -->
+                <groupId>org.cyclonedx</groupId>
+                <artifactId>cyclonedx-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

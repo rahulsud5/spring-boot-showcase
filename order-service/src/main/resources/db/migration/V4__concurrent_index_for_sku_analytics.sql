@@ -1,0 +1,22 @@
+-- =============================================================================
+-- V4: adding an index to a BIG, LIVE table without downtime
+-- =============================================================================
+-- A plain CREATE INDEX takes a lock that BLOCKS ALL WRITES to the table until the build finishes,
+-- which can take minutes on large tables: an outage. CREATE INDEX CONCURRENTLY builds it without
+-- blocking writes (it's slower and does two table scans).
+--
+-- Catch: CONCURRENTLY can't run inside a transaction block, and Flyway wraps every migration in a
+-- transaction by default. The companion file V4__concurrent_index_for_sku_analytics.sql.conf sets
+-- executeInTransaction=false for THIS script only. (Keep such scripts to a single statement: a
+-- failure halfway can't be rolled back.)
+--
+-- Second catch: CONCURRENTLY waits for every open transaction to finish. Flyway's default TRANSACTIONAL
+-- advisory lock on PostgreSQL is such a transaction, so the migration would wait for Flyway itself forever.
+-- application.yml sets spring.flyway.postgresql.transactional-lock=false to avoid this.
+--
+-- If a concurrent build fails, it leaves an INVALID index behind. Check with:
+--     SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+-- then DROP INDEX CONCURRENTLY it and retry.
+-- =============================================================================
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_order_lines_sku_covering
+    ON order_lines (sku) INCLUDE (quantity, unit_amount);

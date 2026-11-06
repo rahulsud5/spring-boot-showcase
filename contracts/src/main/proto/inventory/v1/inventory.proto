@@ -1,0 +1,85 @@
+// =============================================================================
+// Inventory gRPC API, version 1
+// =============================================================================
+// WHY gRPC for stock checks (order-service -> inventory-service)?
+//   - internal, latency-sensitive, high-volume service-to-service calls
+//   - a binary protobuf payload is about 3-10x smaller than JSON and faster to (de)serialize
+//   - HTTP/2 multiplexing: many concurrent calls over ONE connection
+//   - a strongly typed contract with generated client and server code (no hand-written DTOs or clients)
+//   - deadlines propagate across hops; native streaming (StreamStockLevels below)
+// Public, browser-facing APIs stay REST/GraphQL (see docs/08-rest-grpc-graphql.md).
+//
+// SCHEMA EVOLUTION RULES (protobuf compatibility):
+//   - NEVER change or reuse a field NUMBER. Numbers identify fields on the wire; names don't.
+//   - Adding fields is safe: old readers ignore unknown fields, and new readers see default values.
+//   - Removing a field: mark its number "reserved" so nobody reuses it.
+//   - A breaking change gets a new package version (inventory.v2) served side by side.
+//   Tools like "buf breaking" enforce these rules in CI.
+// =============================================================================
+syntax = "proto3";
+
+package inventory.v1;
+
+option java_multiple_files = true;                         // one .java file per message (cleaner imports)
+option java_package = "io.showcase.contracts.inventory.v1";
+option java_outer_classname = "InventoryProto";
+
+service InventoryService {
+  // Unary: "can these lines be fulfilled right now?" A read-only pre-check before an order is accepted.
+  rpc CheckAvailability(CheckAvailabilityRequest) returns (CheckAvailabilityResponse);
+
+  // Unary: synchronous reservation. Note that the main flow reserves ASYNCHRONOUSLY through Kafka (saga);
+  // this RPC exists to compare synchronous and event-driven designs.
+  rpc ReserveStock(ReserveStockRequest) returns (ReserveStockResponse);
+
+  // Server streaming: push stock-level updates for the requested SKUs until the client cancels.
+  rpc StreamStockLevels(StreamStockLevelsRequest) returns (stream StockLevel);
+}
+
+message LineItem {
+  string sku = 1;
+  int32 quantity = 2;
+}
+
+message CheckAvailabilityRequest {
+  repeated LineItem lines = 1;
+}
+
+message CheckAvailabilityResponse {
+  bool all_available = 1;
+  repeated SkuAvailability items = 2;
+}
+
+message SkuAvailability {
+  string sku = 1;
+  int32 requested = 2;
+  int32 available = 3;
+}
+
+message ReserveStockRequest {
+  string order_id = 1;          // also the idempotency key: reserving the same order twice is a no-op
+  repeated LineItem lines = 2;
+}
+
+message ReserveStockResponse {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;     // proto3 convention: the zero value means "not set"
+    RESERVED = 1;
+    REJECTED = 2;
+  }
+  Status status = 1;
+  string reservation_id = 2;
+  repeated string unavailable_skus = 3;
+  reserved 4;                   // example: a field removed in an earlier revision. Its number can never be reused
+}
+
+message StreamStockLevelsRequest {
+  repeated string skus = 1;
+}
+
+message StockLevel {
+  string sku = 1;
+  int32 available = 2;
+  int32 reserved = 3;
+  int64 observed_at_epoch_ms = 4;
+}

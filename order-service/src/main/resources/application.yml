@@ -1,0 +1,312 @@
+# =============================================================================
+#  order-service configuration
+# =============================================================================
+#  PROPERTY SOURCES (later wins): defaults in this file → profile documents below
+#  (spring.config.activate.on-profile) → application-{profile}.yml → OS environment variables
+#  (SPRING_DATASOURCE_URL...) → Java system properties → command-line args (--server.port=9999).
+#  That's why containers can override anything here with env vars, without rebuilding the image.
+#
+#  ${NAME:default} = placeholder with a fallback. Secrets are NEVER committed here: they come from env
+#  vars, config trees (Docker/K8s secrets) or AWS Secrets Manager.
+# =============================================================================
+spring:
+  application:
+    name: order-service
+
+  # --- Java 21 VIRTUAL THREADS for Tomcat, @Async, @Scheduled and messaging listeners
+  threads:
+    virtual:
+      enabled: true
+  main:
+    keep-alive: true            # virtual threads are daemon threads; keeps the JVM alive in non-web runs
+
+  lifecycle:
+    timeout-per-shutdown-phase: 20s   # graceful shutdown budget (must be less than K8s terminationGracePeriodSeconds)
+
+  # --- DATASOURCE (HikariCP, the fastest JDBC pool, auto-configured)
+  datasource:
+    url: jdbc:postgresql://localhost:5432/orders
+    username: orders
+    password: ${DB_PASSWORD:change-me-local-only}
+    hikari:
+      pool-name: orders-pool
+      # Pool sizing rule of thumb: connections = (cores * 2) + spindles. Virtual threads don't need a
+      # bigger pool; the DB is the bottleneck, and extra connections only add contention.
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000          # fail fast (ms) instead of queuing requests forever
+      max-lifetime: 1800000             # recycle before DB/firewall idle timeouts kill connections silently
+      leak-detection-threshold: 30000   # log a stack trace if a connection is held longer than 30 s
+      data-source-properties:
+        reWriteBatchedInserts: true     # PgJDBC rewrites batched INSERTs into multi-row INSERTs (much faster)
+
+  # --- JPA / HIBERNATE 7
+  jpa:
+    open-in-view: false        # IMPORTANT: no lazy loading during view rendering. Transactions end in the service layer
+    hibernate:
+      ddl-auto: validate       # Flyway owns the schema; Hibernate only checks it matches the entities
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 50                 # batch INSERT/UPDATE statements
+          time_zone: UTC                 # store and read timestamps in UTC, whatever the JVM default zone is
+        order_inserts: true              # group inserts by table so batching actually kicks in
+        order_updates: true
+        default_batch_fetch_size: 50     # lazy collections load in batches of 50 (mitigates N+1)
+        query:
+          fail_on_pagination_over_collection_fetch: true   # forbid in-memory pagination of join fetches
+          in_clause_parameter_padding: true                # IN (?,?,?,?) padded to powers of 2: better plan caching
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+    postgresql:
+      # GOTCHA (hit while building this project): on PostgreSQL, Flyway holds its migration lock as a
+      # TRANSACTIONAL advisory lock by default, which keeps a transaction open. CREATE INDEX CONCURRENTLY (V4)
+      # waits for ALL open transactions to finish, including Flyway's own, so the migration hangs forever.
+      # A session-level lock avoids the self-deadlock.
+      transactional-lock: false
+
+  # --- REDIS (cache + idempotency keys)
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 2s
+
+  # --- KAFKA (domain events)
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      acks: all                     # the leader waits for all in-sync replicas: no loss on broker failure
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      compression-type: lz4
+      properties:
+        enable.idempotence: true    # broker dedupes producer retries (exactly-once per partition, per session)
+        linger.ms: 5                # wait up to 5 ms to batch records: much better throughput
+    consumer:
+      group-id: order-service
+      auto-offset-reset: earliest   # a NEW group starts at the beginning (no events missed)
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      isolation-level: read_committed   # skip messages of aborted Kafka transactions (inventory uses EOS)
+      max-poll-records: 100
+    listener:
+      concurrency: 3                # consumer threads per listener (at most #partitions are useful)
+      observation-enabled: true     # propagate trace context through Kafka headers
+    template:
+      observation-enabled: true
+
+  # --- RABBITMQ (notification commands)
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: showcase
+    password: ${RABBITMQ_PASSWORD:showcase}
+    publisher-confirm-type: correlated   # the broker ACKs each publish: we KNOW it was stored
+    publisher-returns: true              # unroutable messages come back instead of vanishing
+    template:
+      mandatory: true
+      observation-enabled: true
+
+  # --- OAUTH2 RESOURCE SERVER: validate JWTs issued by auth-server
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${AUTH_ISSUER_URI:http://localhost:9000}   # discovery: /.well-known/openid-configuration → jwks_uri
+          audiences: order-service                                # reject tokens minted for other APIs
+
+  # --- HTTP SERVICE CLIENTS (Spring Framework 7 registry; group "catalog" = CatalogClient)
+  http:
+    serviceclient:
+      catalog:
+        base-url: ${APP_INVENTORY_REST_BASE_URL:http://localhost:8082}
+        connect-timeout: 1s
+        read-timeout: 2s
+
+  # --- GRAPHQL
+  graphql:
+    graphiql:
+      enabled: true          # in-browser IDE at /graphiql (disable in production)
+    schema:
+      inspection:
+        enabled: true        # logs schema fields without data fetchers, and vice versa
+
+  mvc:
+    problemdetails:
+      enabled: true          # RFC 9457 bodies for Spring MVC's built-in exceptions
+
+  # --- DEV-TIME DOCKER COMPOSE: started automatically when you run the app from the IDE
+  docker:
+    compose:
+      file: ../docker-compose.yml
+      lifecycle-management: start-only   # leave the containers running for the next start
+
+server:
+  port: 8081
+  shutdown: graceful           # stop accepting, finish in-flight requests, then stop
+  error:
+    include-stacktrace: never  # never leak internals in error responses
+    include-message: never
+
+# =============================================================================
+#  ACTUATOR: production readiness
+# =============================================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        # Expose ONLY what you need. heapdump/env/threaddump leak secrets and are attack vectors.
+        include: health, info, prometheus, metrics, outbox, loggers, sbom
+  endpoint:
+    health:
+      probes:
+        enabled: true          # /actuator/health/liveness and /readiness for Kubernetes
+      show-details: when-authorized
+      roles: OPS
+      group:
+        # READINESS checks dependencies (stop routing traffic here while they're down)...
+        readiness:
+          include: readinessState, db, redis, outbox
+        # ...LIVENESS deliberately does NOT: a DB outage must not make Kubernetes RESTART every pod.
+        liveness:
+          include: livenessState
+      status:
+        order: DOWN, OUT_OF_SERVICE, DEGRADED, UP, UNKNOWN
+        http-mapping:
+          DEGRADED: 200        # degraded is still "serving"
+  info:
+    env:
+      enabled: true
+    java:
+      enabled: true
+    os:
+      enabled: true
+    process:
+      enabled: true
+  observations:
+    annotations:
+      enabled: true            # turns @Observed into timers + spans
+  tracing:
+    sampling:
+      probability: 1.0         # 100% locally; typically 0.05 to 0.1 in production (or tail-based sampling)
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true   # latency histograms for SLOs (p95/p99 computed in Prometheus)
+    tags:
+      application: ${spring.application.name}
+
+info:
+  app:
+    description: Order management microservice (REST, GraphQL, Kafka, RabbitMQ, gRPC)
+    team: checkout-team
+
+logging:
+  level:
+    io.showcase: INFO
+    org.springframework.security: INFO       # TRACE shows the full filter chain per request
+
+# =============================================================================
+#  APPLICATION SETTINGS → AppProperties (type-safe, validated at startup)
+# =============================================================================
+app:
+  inventory:
+    grpc-target: ${APP_INVENTORY_GRPC_TARGET:static://localhost:9090}
+    grpc-deadline: 800ms
+  outbox:
+    batch-size: 100
+    health-backlog-threshold: 1000
+    retention: 7d
+    poll-interval: PT0.5S
+  security:
+    # sha256("local-dev-partner-key"). In production, inject via a secret: APP_SECURITY_PARTNERAPIKEYSHA256_0
+    partner-api-key-sha256:
+      - 740afc2bad73816b6b6a4a34bae3301c37a9db5474f0c8b2f1934f279dcf0735
+  fraud:
+    mode: lenient
+    review-threshold-amount: 5000
+
+---
+# =============================================================================
+#  PROFILE "docker": running inside docker compose (see docker-compose.yml)
+# =============================================================================
+spring:
+  config:
+    activate:
+      on-profile: docker
+  docker:
+    compose:
+      enabled: false           # we ARE the compose stack
+logging:
+  structured:
+    format:
+      console: ecs             # JSON logs (Elastic Common Schema), parsed by Loki/ELK without regexes
+
+---
+# =============================================================================
+#  PROFILE "kubernetes": production-like settings
+# =============================================================================
+spring:
+  config:
+    activate:
+      on-profile: kubernetes
+  docker:
+    compose:
+      enabled: false
+  graphql:
+    graphiql:
+      enabled: false
+management:
+  tracing:
+    sampling:
+      probability: 0.1
+logging:
+  structured:
+    format:
+      console: ecs
+app:
+  fraud:
+    mode: strict
+
+---
+# =============================================================================
+#  PROFILE "demo": loads about 50k demo orders (db/demo/R__demo_data.sql) for EXPLAIN experiments
+# =============================================================================
+spring:
+  config:
+    activate:
+      on-profile: demo
+  flyway:
+    locations: classpath:db/migration, classpath:db/demo
+
+---
+# =============================================================================
+#  PROFILE "cds-training": used ONLY by the Dockerfile's CDS training run (no infrastructure at build time)
+# =============================================================================
+spring:
+  config:
+    activate:
+      on-profile: cds-training
+  flyway:
+    enabled: false
+  jpa:
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    hibernate:
+      ddl-auto: none
+    properties:
+      hibernate:
+        boot:
+          allow_jdbc_metadata_access: false   # Hibernate starts without connecting to the DB
+  datasource:
+    hikari:
+      initialization-fail-timeout: -1         # don't fail startup when the DB is unreachable
+  kafka:
+    listener:
+      auto-startup: false
+  docker:
+    compose:
+      enabled: false

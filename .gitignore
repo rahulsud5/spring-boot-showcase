@@ -1,0 +1,11 @@
+target/
+*.class
+*.log
+.idea/
+*.iml
+.vscode/
+.DS_Store
+.env
+# Local secrets for docker compose are generated; only the example file is committed
+docker/secrets/*.txt
+!docker/secrets/*.example.txt

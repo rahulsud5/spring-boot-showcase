@@ -1,0 +1,395 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  =============================================================================
+  ROOT (AGGREGATOR + PARENT) POM
+  =============================================================================
+  This single file plays two different Maven roles. Knowing the difference is
+  the key to understanding multi-module builds:
+
+  1. AGGREGATOR (<modules>): "mvn verify" run here builds every listed module
+     in dependency order. Maven computes that order (the "reactor") from the
+     dependencies between modules, NOT from the order of <module> entries.
+
+  2. PARENT (<packaging>pom</packaging> + the modules' <parent>): every module
+     INHERITS <properties>, <dependencyManagement>, <pluginManagement> and
+     <build><plugins> from here. Shared configuration lives in exactly one place.
+
+  ...and this POM itself inherits from spring-boot-starter-parent, which gives
+  us:
+    - <dependencyManagement> for about 1,000 libraries tested together by the
+      Spring team (the Spring Boot BOM). That's why most dependencies in the
+      modules carry NO <version>.
+    - Sensible plugin defaults: compiler -parameters (needed for
+      @PathVariable names, @Param...), UTF-8 encoding, resource filtering
+      with @...@ placeholders, and surefire/failsafe/jar/spring-boot plugins
+      preconfigured.
+    - A "native" profile for GraalVM native images (mvn -Pnative native:compile).
+
+  ALTERNATIVE: if your company already has its own parent POM, import the
+  Spring Boot BOM instead (spring-boot-dependencies with <scope>import</scope>
+  in <dependencyManagement>). You then configure the plugins yourself.
+
+  USEFUL COMMANDS
+    mvn verify                         compile, unit tests (surefire), integration tests (failsafe)
+    mvn -pl order-service -am verify   build ONE module plus the modules it depends on (-am = also-make)
+    mvn -T 1C verify                   parallel build, one thread per CPU core
+    mvn -Pci verify                    CI profile: enforce coverage thresholds
+    mvn dependency:tree -pl order-service       why is this jar on my classpath?
+    mvn versions:display-dependency-updates     what can be upgraded?
+    mvn spring-boot:run -pl order-service       run with dev-time Docker Compose support
+    mvn spring-boot:build-image -pl order-service   OCI image via Cloud Native Buildpacks (no Dockerfile)
+
+  The full walkthrough is in docs/17-maven-build.md
+  =============================================================================
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <!-- Spring Boot 4.1.x = Spring Framework 7.0.x, Spring Security 7.1, Spring Data 2026.0,
+             Jakarta EE 11, Jackson 3, Hibernate 7. Pinned in ONE place for the whole repo. -->
+        <version>4.1.2</version>
+        <relativePath/> <!-- resolve from the repository, not from ../pom.xml -->
+    </parent>
+
+    <groupId>io.showcase</groupId>
+    <artifactId>spring-boot-showcase</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>Spring Boot Showcase</name>
+    <description>Microservices reference project: Spring Boot 4, Spring Framework 7, Java 21</description>
+
+    <modules>
+        <module>contracts</module>            <!-- shared event records + gRPC/protobuf contracts -->
+        <module>auth-server</module>          <!-- OAuth2 / OIDC authorization server (issues JWTs) -->
+        <module>api-gateway</module>          <!-- Spring Cloud Gateway: routing, rate limiting, circuit breaking -->
+        <module>order-service</module>        <!-- flagship: REST, GraphQL, JPA, transactions, Kafka, RabbitMQ, Redis, gRPC client -->
+        <module>inventory-service</module>    <!-- MongoDB (NoSQL), gRPC server, Kafka exactly-once -->
+        <module>notification-service</module> <!-- RabbitMQ consumer + AWS (S3, SES, SQS, SNS) -->
+    </modules>
+
+    <properties>
+        <!-- The Boot parent turns java.version into maven.compiler.release=21. "release" (not source/target)
+             also checks that you only use JDK 21 APIs, even when compiling on a newer JDK. -->
+        <java.version>21</java.version>
+
+        <!-- Release trains / BOMs that are NOT part of the Spring Boot BOM -->
+        <spring-cloud.version>2025.1.4</spring-cloud.version>          <!-- "Oakwood": Gateway 5, CircuitBreaker 5 -->
+        <spring-cloud-aws.version>4.2.1</spring-cloud-aws.version>     <!-- Spring Cloud AWS 4.x targets Boot 4 / Framework 7 -->
+
+        <!-- Libraries not managed by Spring Boot -->
+        <springdoc.version>3.2.0</springdoc.version>                   <!-- 3.x line = Spring Boot 4 -->
+        <archunit.version>1.5.1</archunit.version>
+        <jacoco.version>0.8.13</jacoco.version>
+
+        <!-- Protobuf / gRPC CODE GENERATION. The runtime jars are managed by Spring Boot 4.1's gRPC support.
+             Rule: generated code must NOT be newer than the runtime, so we pin a conservative protoc. -->
+        <protoc.version>4.29.3</protoc.version>
+        <grpc-codegen.version>1.70.0</grpc-codegen.version>
+        <os-maven-plugin.version>1.7.1</os-maven-plugin.version>
+        <protobuf-maven-plugin.version>0.6.1</protobuf-maven-plugin.version>
+
+        <!-- Quality gate (enforced in the "ci" profile) -->
+        <jacoco.minimum.line.coverage>0.70</jacoco.minimum.line.coverage>
+    </properties>
+
+    <!--
+      dependencyManagement = "IF a module uses this artifact, use THIS version". It adds nothing to the
+      classpath by itself. Importing BOMs (<type>pom</type><scope>import</scope>) pulls in whole curated
+      version sets.
+    -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.awspring.cloud</groupId>
+                <artifactId>spring-cloud-aws-dependencies</artifactId>
+                <version>${spring-cloud-aws.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+
+            <!-- Our own modules: versioned together with ${project.version} -->
+            <dependency>
+                <groupId>io.showcase</groupId>
+                <artifactId>contracts</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>org.springdoc</groupId>
+                <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+                <version>${springdoc.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.tngtech.archunit</groupId>
+                <artifactId>archunit-junit5</artifactId>
+                <version>${archunit.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <build>
+        <!-- pluginManagement = configuration TEMPLATES. They only take effect in modules that declare the plugin. -->
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <configuration>
+                        <compilerArgs>
+                            <!-- Warn about unchecked generics, deprecated APIs, etc. Code review starts at the compiler. -->
+                            <arg>-Xlint:all,-processing,-serial</arg>
+                        </compilerArgs>
+                    </configuration>
+                </plugin>
+
+                <!--
+                  TEST PLUGINS: the split that keeps feedback fast
+                    surefire (phase "test")              runs *Test / *Tests: fast unit and slice tests, no Docker
+                    failsafe (phases "integration-test" + "verify")
+                                                         runs *IT: Testcontainers, full Spring context
+                  failsafe's "verify" goal fails the build AFTER containers and resources are cleaned up, which
+                  is why integration tests belong in failsafe and not surefire.
+                -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-surefire-plugin</artifactId>
+                    <configuration>
+                        <!-- Run test classes in parallel on JUnit 5, but keep methods in a class sequential -->
+                        <properties>
+                            <configurationParameters>
+                                junit.jupiter.execution.parallel.enabled=true
+                                junit.jupiter.execution.parallel.mode.default=same_thread
+                                junit.jupiter.execution.parallel.mode.classes.default=concurrent
+                            </configurationParameters>
+                        </properties>
+                    </configuration>
+                </plugin>
+
+                <plugin>
+                    <groupId>org.jacoco</groupId>
+                    <artifactId>jacoco-maven-plugin</artifactId>
+                    <version>${jacoco.version}</version>
+                </plugin>
+
+                <!-- protoc + the gRPC Java plugin, downloaded per OS/architecture thanks to os-maven-plugin -->
+                <plugin>
+                    <groupId>org.xolstice.maven.plugins</groupId>
+                    <artifactId>protobuf-maven-plugin</artifactId>
+                    <version>${protobuf-maven-plugin.version}</version>
+                    <configuration>
+                        <protocArtifact>com.google.protobuf:protoc:${protoc.version}:exe:${os.detected.classifier}</protocArtifact>
+                        <pluginId>grpc-java</pluginId>
+                        <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc-codegen.version}:exe:${os.detected.classifier}</pluginArtifact>
+                        <!-- Don't emit @javax.annotation.Generated (javax.* is gone in Jakarta EE 11) -->
+                        <pluginParameter>@generated=omit</pluginParameter>
+                    </configuration>
+                </plugin>
+
+                <plugin>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-maven-plugin</artifactId>
+                    <executions>
+                        <execution>
+                            <!-- Writes META-INF/build-info.properties, which /actuator/info shows automatically -->
+                            <id>build-info</id>
+                            <goals>
+                                <goal>build-info</goal>
+                            </goals>
+                        </execution>
+                    </executions>
+                    <configuration>
+                        <!-- Settings for "mvn spring-boot:build-image" (Cloud Native Buildpacks, no Dockerfile) -->
+                        <image>
+                            <name>registry.example.com/showcase/${project.artifactId}:${project.version}</name>
+                            <env>
+                                <BP_JVM_VERSION>21</BP_JVM_VERSION>
+                                <!-- Bake a CDS archive into the image for faster startup -->
+                                <BP_JVM_CDS_ENABLED>true</BP_JVM_CDS_ENABLED>
+                            </env>
+                        </image>
+                    </configuration>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+
+        <!-- <plugins> here are INHERITED and ACTIVE in every module -->
+        <plugins>
+            <!--
+              ENFORCER: build rules that fail fast with a clear message instead of a confusing error later.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-enforcer-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>enforce-build-rules</id>
+                        <goals>
+                            <goal>enforce</goal>
+                        </goals>
+                        <configuration>
+                            <rules>
+                                <requireJavaVersion>
+                                    <version>[21,)</version>
+                                    <message>This project needs JDK 21+ (records, sealed types, virtual threads).</message>
+                                </requireJavaVersion>
+                                <requireMavenVersion>
+                                    <version>[3.9,)</version>
+                                </requireMavenVersion>
+                                <banDuplicatePomDependencyVersions/>
+                                <bannedDependencies>
+                                    <excludes>
+                                        <!-- JUnit 4 sneaking in via a transitive dependency silently skips tests -->
+                                        <exclude>junit:junit</exclude>
+                                        <!-- Log4j 1.x is EOL with known CVEs -->
+                                        <exclude>log4j:log4j</exclude>
+                                        <!-- NOTE: Spring Framework 6 shipped its own "spring-jcl" bridge and teams often banned
+                                             commons-logging. Spring Framework 7 dropped spring-jcl and depends on Apache
+                                             Commons Logging 1.3+ directly, which detects SLF4J/Log4j 2 by itself.
+                                             So commons-logging is no longer banned; only the ancient 1.0/1.1 versions are. -->
+                                        <exclude>commons-logging:commons-logging:[,1.3)</exclude>
+                                    </excludes>
+                                    <message>Banned dependency found. Run mvn dependency:tree and add an exclusion.</message>
+                                </bannedDependencies>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!-- Integration tests (*IT.java) run in the integration-test phase and are verified in verify -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!--
+              JACOCO: code coverage. prepare-agent sets the argLine that surefire/failsafe use to attach the
+              agent. report writes target/site/jacoco (HTML + XML, which GitLab reads for MR coverage diffs).
+            -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!--
+          CI profile: stricter gates that would slow down local feedback loops.
+          Activated in .gitlab-ci.yml with -Pci.
+        -->
+        <profile>
+            <id>ci</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.jacoco</groupId>
+                        <artifactId>jacoco-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>coverage-gate</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>check</goal>
+                                </goals>
+                                <configuration>
+                                    <rules>
+                                        <rule>
+                                            <element>BUNDLE</element>
+                                            <limits>
+                                                <limit>
+                                                    <counter>LINE</counter>
+                                                    <value>COVEREDRATIO</value>
+                                                    <minimum>${jacoco.minimum.line.coverage}</minimum>
+                                                </limit>
+                                            </limits>
+                                        </rule>
+                                    </rules>
+                                    <!-- Generated protobuf code isn't ours to test -->
+                                    <excludes>
+                                        <exclude>io/showcase/contracts/inventory/**</exclude>
+                                    </excludes>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!--
+          Supply-chain security: OWASP Dependency-Check scans every jar against the NVD CVE database.
+          Slow (it downloads the NVD feed), so it runs on a schedule (nightly) rather than on every commit.
+            mvn -Psecurity verify
+        -->
+        <profile>
+            <id>security</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.owasp</groupId>
+                        <artifactId>dependency-check-maven</artifactId>
+                        <version>13.0.0</version>
+                        <configuration>
+                            <failBuildOnCVSS>7</failBuildOnCVSS>   <!-- fail on HIGH or CRITICAL -->
+                            <formats>
+                                <format>HTML</format>
+                                <format>JSON</format>
+                            </formats>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <goals>
+                                    <goal>aggregate</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Skip integration tests locally when Docker isn't available:  mvn verify -Pfast -->
+        <profile>
+            <id>fast</id>
+            <properties>
+                <skipITs>true</skipITs>
+            </properties>
+        </profile>
+    </profiles>
+</project>

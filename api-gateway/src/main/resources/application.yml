@@ -1,0 +1,120 @@
+# =============================================================================
+#  API GATEWAY configuration
+# =============================================================================
+spring:
+  application:
+    name: api-gateway
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${AUTH_ISSUER_URI:http://localhost:9000}
+
+  cloud:
+    gateway:
+      server:
+        webflux:
+          # Filters applied to EVERY route
+          default-filters:
+            - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials, RETAIN_FIRST
+            - SecureHeaders          # X-Content-Type-Options, X-Frame-Options, HSTS, Referrer-Policy...
+          globalcors:
+            cors-configurations:
+              "[/**]":
+                allowed-origins: "http://localhost:3001,https://shop.showcase.example"
+                allowed-methods: GET, POST
+                allowed-headers: Authorization, Content-Type, Idempotency-Key, X-API-Version, X-Correlation-Id
+                exposed-headers: Location, X-Correlation-Id
+                max-age: 3600
+
+          routes:
+            # ---------------------------------------------------------------
+            # ORDERS: authenticated, rate limited, circuit breaker + fallback
+            # ---------------------------------------------------------------
+            - id: orders
+              uri: ${ORDER_SERVICE_URI:http://localhost:8081}
+              predicates:
+                - Path=/api/orders/**, /graphql
+              filters:
+                # TOKEN BUCKET per user in Redis: 10 requests/s sustained, bursts up to 20.
+                # Exceeding it returns 429 Too Many Requests with X-RateLimit-* headers.
+                - name: RequestRateLimiter
+                  args:
+                    redis-rate-limiter.replenishRate: 10
+                    redis-rate-limiter.burstCapacity: 20
+                    redis-rate-limiter.requestedTokens: 1
+                    key-resolver: "#{@userKeyResolver}"
+                # Circuit breaker (Resilience4j): an open circuit or a timeout is forwarded to the fallback
+                - name: CircuitBreaker
+                  args:
+                    name: orders
+                    fallbackUri: forward:/fallback/orders
+                    statusCodes: 500, 502, 503, 504
+                # Retry ONLY idempotent GETs; never blindly retry POSTs (duplicate orders!)
+                - name: Retry
+                  args:
+                    retries: 2
+                    methods: GET
+                    series: SERVER_ERROR
+                    backoff:
+                      firstBackoff: 100ms
+                      maxBackoff: 1s
+                      factor: 2
+
+            # ---------------------------------------------------------------
+            # CATALOG: public, cacheable
+            # ---------------------------------------------------------------
+            - id: catalog
+              uri: ${INVENTORY_SERVICE_URI:http://localhost:8082}
+              predicates:
+                - Path=/api/products/**
+                - Method=GET
+              filters:
+                - AddResponseHeader=X-Served-By, api-gateway
+
+# Resilience4j settings for the gateway's "orders" circuit breaker
+resilience4j:
+  circuitbreaker:
+    instances:
+      orders:
+        sliding-window-size: 20
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+  timelimiter:
+    instances:
+      orders:
+        timeout-duration: 3s
+
+server:
+  port: 8080
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus, gateway   # /actuator/gateway/routes lists the active routes
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  tracing:
+    sampling:
+      probability: 1.0
+
+---
+spring:
+  config:
+    activate:
+      on-profile: docker
+logging:
+  structured:
+    format:
+      console: ecs

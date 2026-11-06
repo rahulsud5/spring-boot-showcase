@@ -1,0 +1,102 @@
+### =============================================================================
+### Runnable request collection (IntelliJ HTTP Client / VS Code "REST Client").
+### Start the platform first:  docker compose --profile apps up -d --build
+### =============================================================================
+
+@gateway = http://localhost:8080
+@orders  = http://localhost:8081
+@auth    = http://localhost:9000
+
+### 1. Token via CLIENT CREDENTIALS (service-to-service; sub = machine-client)
+# @name token
+POST {{auth}}/oauth2/token
+Authorization: Basic machine-client machine-secret
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&scope=orders.read orders.write
+
+> {% client.global.set("token", response.body.access_token); %}
+
+### 2. OpenID discovery + public signing keys
+GET {{auth}}/.well-known/openid-configuration
+
+###
+GET {{auth}}/oauth2/jwks
+
+### 3. Place an order (idempotent: re-send it with the same key and you get the same order back, 200)
+# @name placeOrder
+POST {{gateway}}/api/orders
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: demo-order-0001
+
+{
+  "shippingAddress": {"street": "1 Main St", "city": "Amsterdam", "postalCode": "1011", "country": "NL"},
+  "items": [{"sku": "SKU-0001", "quantity": 2}, {"sku": "SKU-COFFEE", "quantity": 3}],
+  "discountCode": "COFFEE3FOR2",
+  "metadata": {"channel": "mobile", "campaign": "black-friday"}
+}
+
+> {% client.global.set("orderId", response.body.id); %}
+
+### 4. Read it: version 1 (default) vs version 2 (adds the status history)
+GET {{gateway}}/api/orders/{{orderId}}
+Authorization: Bearer {{token}}
+
+###
+GET {{gateway}}/api/orders/{{orderId}}
+Authorization: Bearer {{token}}
+X-API-Version: 2
+
+### 5. My orders, keyset pagination (pass nextCursor from the response as ?cursor=...)
+GET {{gateway}}/api/orders/mine?size=5
+Authorization: Bearer {{token}}
+
+### 6. GraphQL: select exactly the fields you need; lines are batch-loaded
+POST {{gateway}}/graphql
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{"query": "{ myOrders(limit: 5) { id status total { amount currency } lines { sku quantity lineTotal } history { toStatus changedAt } } }"}
+
+### 7. Cancel (triggers the compensating StockReleased in inventory-service)
+POST {{gateway}}/api/orders/{{orderId}}/cancel
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{"reason": "changed my mind"}
+
+### 8. Validation error → RFC 9457 Problem Details (400)
+POST {{orders}}/api/orders
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Idempotency-Key: demo-invalid-0001
+
+{"shippingAddress": {"street": "", "city": "X", "postalCode": "1", "country": "Netherlands"}, "items": [{"sku": "bad", "quantity": 0}]}
+
+### 9. Partner webhook with an API key (custom security filter)
+POST {{orders}}/api/webhooks/payments
+X-API-Key: local-dev-partner-key
+Content-Type: application/json
+
+{"providerEventId": "evt_123", "orderId": "{{orderId}}", "status": "PAID"}
+
+### 10. Public catalog through the gateway (HTTP-cacheable) + the deprecated legacy route
+GET {{gateway}}/api/products/SKU-0001/price
+
+###
+GET {{gateway}}/legacy/catalog/SKU-0001
+
+### 11. Catalog analytics (MongoDB aggregation pipeline with $lookup)
+GET http://localhost:8082/api/products/analytics/categories
+
+### 12. Actuator
+GET {{orders}}/actuator/health/readiness
+
+###
+GET {{orders}}/actuator/prometheus
+
+### 13. Admin-only endpoints need a user with ROLE_ADMIN (bob). Use the authorization-code flow with PKCE
+###     (client shop-web) from a browser or Postman, then:
+# GET {{gateway}}/api/orders?status=CONFIRMED&minTotal=100&page=0&size=20
+# GET {{gateway}}/api/orders/reports/daily-revenue?from=2026-01-01&to=2026-12-31

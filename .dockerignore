@@ -1,0 +1,16 @@
+# The build context is sent to the Docker daemon on EVERY build. Excluding these keeps builds fast and
+# avoids leaking secrets or local artifacts into image layers.
+**/target/
+**/.idea/
+**/*.iml
+**/.vscode/
+**/.DS_Store
+**/node_modules/
+.git/
+.gitlab-ci.yml
+docs/
+deploy/
+docker/secrets/
+*.md
+!**/src/**/*.md
+.env

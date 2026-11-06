@@ -1,0 +1,140 @@
+# =============================================================================
+# order-service on Kubernetes: a production-ready Deployment checklist in YAML form
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: order-service
+  annotations:
+    # IRSA (IAM Roles for Service Accounts): pods get temporary AWS credentials for THIS role only.
+    # No access keys in env vars or secrets. EKS Pod Identity is the newer alternative.
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/showcase-order-service
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  labels: { app: order-service }
+spec:
+  replicas: 3                       # at least 3 to survive one pod failure plus one rolling update
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0             # never drop below the desired capacity during deploys
+      maxSurge: 1
+  selector:
+    matchLabels: { app: order-service }
+  template:
+    metadata:
+      labels: { app: order-service }
+    spec:
+      serviceAccountName: order-service
+      # Spread replicas across availability zones: losing one AZ doesn't take the service down
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: order-service }
+      # Must be longer than spring.lifecycle.timeout-per-shutdown-phase (20s) plus the preStop sleep
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: order-service
+          image: showcase/order-service     # rewritten by "kustomize edit set image" in CI
+          ports:
+            - { name: http, containerPort: 8081 }
+          env:
+            - { name: SPRING_PROFILES_ACTIVE, value: kubernetes }
+            - { name: SERVER_PORT, value: "8081" }
+            # Non-secret config comes from a ConfigMap, secrets from a Secret (synced from AWS Secrets
+            # Manager by the External Secrets Operator)
+          envFrom:
+            - configMapRef: { name: order-service-config }
+            - secretRef: { name: order-service-secrets }
+          resources:
+            # requests = the scheduling guarantee; limits = the hard cap. Memory limit == request avoids
+            # OOM-kill surprises when the node is under pressure. No CPU limit: avoids CFS throttling of
+            # JIT/GC threads, a common cause of latency spikes for JVMs.
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { memory: "1Gi" }
+          # PROBES map onto Spring Boot's availability states (management.endpoint.health.probes.enabled)
+          startupProbe:                    # gives slow JVM startup up to 2 minutes before liveness kicks in
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:                   # "is the process healthy?" Failure = RESTART. Never include the DB here!
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:                  # "can it take traffic?" Failure = removed from the Service, no restart
+            httpGet: { path: /actuator/health/readiness, port: http }
+            periodSeconds: 5
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Give kube-proxy/ingress time to remove the pod from endpoints BEFORE Spring starts
+              # refusing requests. Without this, a few requests fail during every rolling update.
+              sleep: { seconds: 10 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { medium: Memory, sizeLimit: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+spec:
+  selector: { app: order-service }
+  ports:
+    - { name: http, port: 8081, targetPort: http }
+---
+# Keep at least 2 pods running during VOLUNTARY disruptions (node drains, cluster upgrades)
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: { app: order-service }
+---
+# Horizontal Pod Autoscaler: scale on CPU. Kafka-driven services often scale on consumer LAG instead (KEDA).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: order-service }
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 65 }
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300    # avoid flapping: scale down slowly, scale up fast
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-service-config
+data:
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: "b-1.msk.example:9098,b-2.msk.example:9098"   # Amazon MSK (IAM auth)
+  SPRING_DATA_REDIS_HOST: "showcase.xxxxxx.cache.amazonaws.com"                  # ElastiCache
+  APP_INVENTORY_GRPC_TARGET: "dns:///inventory-service:9090"
+  APP_INVENTORY_REST_BASE_URL: "http://inventory-service:8082"
+  AUTH_ISSUER_URI: "https://auth.showcase.example.com"

@@ -1,0 +1,321 @@
+# =============================================================================
+#  LOCAL ENVIRONMENT: the whole platform on one machine
+# =============================================================================
+#  Infrastructure only (run the services from your IDE):
+#      docker compose up -d
+#  Infrastructure + all 5 services, built from the shared Dockerfile:
+#      docker compose --profile apps up -d --build
+#  Plus extra tooling (Kafka UI):
+#      docker compose --profile apps --profile tools up -d
+#
+#  Spring Boot's spring-boot-docker-compose module can also START this file for you when you run a
+#  service from the IDE, and it auto-configures connection details from the running containers
+#  (see order-service/pom.xml).
+#
+#  Advanced Compose features shown here:
+#    - extension fields (x-*) + YAML anchors/merge keys (<<) to avoid repetition
+#    - profiles: optional groups of services
+#    - healthchecks + depends_on: condition: service_healthy (real startup ordering)
+#    - Docker secrets mapped onto Spring's "configtree" property source
+#    - hardening: read_only root filesystem, tmpfs, cap_drop ALL, no-new-privileges, non-root
+#    - resource limits (the JVM sizes its heap from them via MaxRAMPercentage)
+#    - two networks: "edge" (published to the host) and "backend" (internal only)
+#    - a one-shot init container (kafka-init) and a MongoDB replica set (for multi-document transactions)
+#  docs/16-docker.md walks through every block.
+# =============================================================================
+name: showcase
+
+# -----------------------------------------------------------------------------
+# Reusable fragments. Keys starting with x- are ignored by Compose itself; they exist for anchors.
+# -----------------------------------------------------------------------------
+x-java-service: &java-service
+  restart: unless-stopped
+  profiles: [apps]
+  networks: [backend]
+  read_only: true                  # the container can't modify its own filesystem...
+  tmpfs:
+    - /tmp                         # ...except a RAM-backed /tmp (Tomcat work dir, multipart uploads)
+  security_opt:
+    - no-new-privileges:true       # blocks privilege escalation through setuid binaries
+  cap_drop: [ALL]                  # a JVM web app needs no Linux capabilities
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 768M               # the heap gets about 75% of this (MaxRAMPercentage in the Dockerfile)
+  healthcheck:
+    # No curl in a slim image: bash's /dev/tcp pseudo-device performs a tiny HTTP request.
+    # The readiness probe = "ready for traffic" (DB, Kafka... reachable), not just "process is alive".
+    test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/$${SERVER_PORT} && printf \"GET /actuator/health/readiness HTTP/1.0\\r\\n\\r\\n\" >&3 && grep -q UP <&3'"]
+    interval: 10s
+    timeout: 3s
+    retries: 12
+    start_period: 40s
+
+x-java-env: &java-env
+  SPRING_PROFILES_ACTIVE: docker
+  # Standard OpenTelemetry env var: Spring Boot 4.1 reads OTEL_* variables natively.
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment=local
+  # Issuer of the JWTs. All resource servers must use EXACTLY the "iss" value the auth server writes.
+  AUTH_ISSUER_URI: http://auth-server:9000
+
+secrets:
+  postgres_password:
+    file: ./docker/secrets/postgres_password.txt   # dev only; created by: cp docker/secrets/postgres_password.example.txt docker/secrets/postgres_password.txt
+
+networks:
+  edge: {}                 # ports published to the host
+  backend:
+    internal: false        # set to true to cut off internet access for backend containers
+
+volumes:
+  postgres-data: {}
+  mongo-data: {}
+  kafka-data: {}
+  rabbitmq-data: {}
+
+services:
+  # ===========================================================================
+  # DATA STORES
+  # ===========================================================================
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: orders
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password   # read the password from a secret file, not an env var
+    secrets: [postgres_password]
+    command:
+      # Tuning flags worth knowing. pg_stat_statements is THE tool for finding slow queries.
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - log_min_duration_statement=250       # log every query slower than 250 ms
+      - -c
+      - max_connections=200
+    ports: ["5432:5432"]
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    networks: [backend, edge]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mongo:
+    image: mongo:8.0
+    # Multi-document transactions need a REPLICA SET, even a single-node one.
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports: ["27017:27017"]
+    volumes: [mongo-data:/data/db]
+    networks: [backend, edge]
+    healthcheck:
+      # Idempotent trick: initiate the replica set if needed, and report healthy once it's PRIMARY
+      test: >
+        mongosh --quiet --eval "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}).ok }"
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  redis:
+    image: redis:7.4-alpine
+    # appendonly = durability for idempotency keys; maxmemory-policy = cache eviction behavior
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports: ["6379:6379"]
+    networks: [backend, edge]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ===========================================================================
+  # MESSAGING
+  # ===========================================================================
+  kafka:
+    image: apache/kafka:4.0.0          # Kafka 4 = KRaft only (no ZooKeeper)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller        # combined mode: fine for dev, separate them in prod
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      # Two advertised listeners: containers use kafka:29092, your IDE uses localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1   # needed for the exactly-once demo in inventory-service
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"            # topics are created deliberately (kafka-init / NewTopic beans)
+    ports: ["9092:9092"]
+    volumes: [kafka-data:/var/lib/kafka/data]
+    networks: [backend, edge]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  # One-shot INIT CONTAINER: creates topics with explicit partitions and retention, then exits.
+  kafka-init:
+    image: apache/kafka:4.0.0
+    depends_on:
+      kafka: { condition: service_healthy }
+    networks: [backend]
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        K=/opt/kafka/bin/kafka-topics.sh
+        $$K --bootstrap-server kafka:29092 --create --if-not-exists --topic orders.events.v1 --partitions 6 --replication-factor 1 --config retention.ms=604800000
+        $$K --bootstrap-server kafka:29092 --create --if-not-exists --topic inventory.events.v1 --partitions 6 --replication-factor 1
+        $$K --bootstrap-server kafka:29092 --create --if-not-exists --topic inventory.events.v1-dlt --partitions 1 --replication-factor 1
+        $$K --bootstrap-server kafka:29092 --create --if-not-exists --topic orders.events.v1-dlt --partitions 1 --replication-factor 1
+        echo "topics ready"
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: showcase
+      RABBITMQ_DEFAULT_PASS: showcase
+    ports:
+      - "5672:5672"      # AMQP
+      - "15672:15672"    # management UI: http://localhost:15672
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    networks: [backend, edge]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # ===========================================================================
+  # AWS EMULATION: LocalStack (S3, SES, SQS, SNS, Secrets Manager)
+  # Recent LocalStack images may require a (free) auth token: put LOCALSTACK_AUTH_TOKEN in .env
+  # ===========================================================================
+  localstack:
+    image: localstack/localstack:4
+    environment:
+      SERVICES: s3,ses,sqs,sns,secretsmanager,ssm
+      AWS_DEFAULT_REGION: eu-west-1
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
+    ports: ["4566:4566"]
+    volumes:
+      # Scripts in ready.d run once LocalStack is up: buckets, queues and topics get created
+      - ./docker/localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+    networks: [backend, edge]
+    healthcheck:
+      test: ["CMD-SHELL", "awslocal s3 ls s3://showcase-receipts > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # ===========================================================================
+  # OBSERVABILITY: Grafana LGTM all-in-one (Loki logs, Grafana, Tempo traces, Mimir/Prometheus metrics)
+  # with an OpenTelemetry Collector built in. Grafana: http://localhost:3000 (admin/admin)
+  # ===========================================================================
+  lgtm:
+    image: grafana/otel-lgtm:latest     # pin a version or digest in real projects
+    ports:
+      - "3000:3000"   # Grafana
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    networks: [backend, edge]
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    profiles: [tools]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    ports: ["8090:8080"]
+    depends_on:
+      kafka: { condition: service_healthy }
+    networks: [backend, edge]
+
+  # ===========================================================================
+  # APPLICATION SERVICES (profile "apps"), all built from the root Dockerfile
+  # ===========================================================================
+  auth-server:
+    <<: *java-service
+    build: { context: ., args: { MODULE: auth-server } }
+    image: showcase/auth-server:local
+    environment:
+      <<: *java-env
+      SERVER_PORT: 9000
+    ports: ["9000:9000"]
+    networks: [backend, edge]
+
+  order-service:
+    <<: *java-service
+    build: { context: ., args: { MODULE: order-service } }
+    image: showcase/order-service:local
+    environment:
+      <<: *java-env
+      SERVER_PORT: 8081
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/orders
+      SPRING_DATASOURCE_USERNAME: orders
+      # Password: NOT an env var. Docker mounts the secret as /run/secrets/spring.datasource.password and
+      # Spring reads it through spring.config.import=optional:configtree:/run/secrets/
+      SPRING_CONFIG_IMPORT: optional:configtree:/run/secrets/
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_RABBITMQ_HOST: rabbitmq
+      APP_INVENTORY_GRPC_TARGET: static://inventory-service:9090
+      APP_INVENTORY_REST_BASE_URL: http://inventory-service:8082
+    secrets:
+      - source: postgres_password
+        target: spring.datasource.password      # the file name becomes the property name (configtree)
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+      auth-server: { condition: service_healthy }
+
+  inventory-service:
+    <<: *java-service
+    build: { context: ., args: { MODULE: inventory-service } }
+    image: showcase/inventory-service:local
+    environment:
+      <<: *java-env
+      SERVER_PORT: 8082
+      SPRING_MONGODB_URI: mongodb://mongo:27017/inventory?replicaSet=rs0
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      mongo: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+
+  notification-service:
+    <<: *java-service
+    build: { context: ., args: { MODULE: notification-service } }
+    image: showcase/notification-service:local
+    environment:
+      <<: *java-env
+      SERVER_PORT: 8083
+      SPRING_RABBITMQ_HOST: rabbitmq
+      SPRING_CLOUD_AWS_ENDPOINT: http://localstack:4566
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      localstack: { condition: service_healthy }
+
+  api-gateway:
+    <<: *java-service
+    build: { context: ., args: { MODULE: api-gateway } }
+    image: showcase/api-gateway:local
+    environment:
+      <<: *java-env
+      SERVER_PORT: 8080
+      SPRING_DATA_REDIS_HOST: redis
+      ORDER_SERVICE_URI: http://order-service:8081
+      INVENTORY_SERVICE_URI: http://inventory-service:8082
+    ports: ["8080:8080"]
+    networks: [backend, edge]
+    depends_on:
+      redis: { condition: service_healthy }
+      order-service: { condition: service_healthy }

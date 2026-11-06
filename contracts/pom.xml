@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CONTRACTS MODULE: the "published language" shared between services.
+    - Integration event records (Kafka payloads) and messaging names (topics, exchanges)
+    - The gRPC/protobuf API of inventory-service (Java stubs are GENERATED at build time)
+
+  DESIGN RULE: keep this module tiny and framework-free (no Spring, no JPA). A shared library that grows
+  business logic couples deployments together, the "distributed monolith" anti-pattern.
+  Many teams go further and publish only schemas (.proto, Avro, JSON Schema) to a schema registry,
+  letting each service generate its own classes.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.showcase</groupId>
+        <artifactId>spring-boot-showcase</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>contracts</artifactId>
+    <name>contracts</name>
+
+    <dependencies>
+        <!-- Versions come from the Spring Boot BOM (Boot 4.1 manages gRPC + protobuf for its gRPC support) -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-protobuf</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-stub</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- Detects the OS/arch (linux-x86_64, osx-aarch_64...) so the right native protoc binary is downloaded -->
+        <extensions>
+            <extension>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+                <version>${os-maven-plugin.version}</version>
+            </extension>
+        </extensions>
+        <plugins>
+            <plugin>
+                <groupId>org.xolstice.maven.plugins</groupId>
+                <artifactId>protobuf-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>compile</goal>         <!-- messages  -> target/generated-sources/protobuf/java -->
+                            <goal>compile-custom</goal>  <!-- services  -> target/generated-sources/protobuf/grpc-java -->
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

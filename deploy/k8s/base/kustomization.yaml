@@ -1,0 +1,11 @@
+# Kustomize BASE: environment-independent manifests. Overlays patch replicas, resources and config per
+# environment, with no templating language.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - order-service.yaml
+  - other-services.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: spring-boot-showcase
+      app.kubernetes.io/managed-by: kustomize

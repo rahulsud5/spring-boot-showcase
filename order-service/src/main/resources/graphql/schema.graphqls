@@ -1,0 +1,75 @@
+# =============================================================================
+# GraphQL schema of order-service (Spring for GraphQL 2.0, SCHEMA-FIRST)
+# =============================================================================
+# Schema-first: this file IS the contract. Spring maps it to @Controller methods by NAME
+# (@QueryMapping order → Query.order, @SchemaMapping(typeName="Order", field="total") → Order.total).
+# At startup Spring INSPECTS the mapping and logs schema fields without a data fetcher (and vice
+# versa), so contract drift is caught early.
+#
+# Why GraphQL next to REST? Clients (mobile screens, dashboards) select EXACTLY the fields they need
+# in ONE round trip, which removes over- and under-fetching. The cost: harder HTTP caching, query
+# complexity attacks (mitigated with depth/complexity limits) and the N+1 problem (solved below with
+# @BatchMapping). See docs/08-rest-grpc-graphql.md.
+#
+# Try it: POST /graphql   {"query": "{ myOrders(limit: 5) { id status total { amount currency } lines { sku quantity } } }"}
+# The GraphiQL UI is at /graphiql (enabled in application.yml for local development).
+# =============================================================================
+
+type Query {
+    "A single order. Customers can only read their own orders."
+    order(id: ID!): Order
+
+    "The caller's most recent orders."
+    myOrders(limit: Int = 10): [Order!]!
+
+    "Back-office: recent orders in a given status (ADMIN only)."
+    ordersByStatus(status: OrderStatus!, limit: Int = 20): [Order!]!
+}
+
+type Mutation {
+    "Cancel one of your orders. Fails with a business error if the order has already shipped."
+    cancelOrder(id: ID!, reason: String!): Order!
+}
+
+type Order {
+    id: ID!
+    customerId: String!
+    status: OrderStatus!
+    total: Money!
+    createdAt: String
+    "Resolved in BATCH for all orders in the response: one SQL query, not one per order."
+    lines: [OrderLine!]!
+    "Resolved per order (fine for single-order queries; see the controller for the trade-off)."
+    history: [StatusChange!]!
+}
+
+"""
+Money is exposed as a STRING amount: GraphQL's Float is a double, which would corrupt currency
+values. (The graphql-java-extended-scalars library offers a BigDecimal scalar as an alternative.)
+"""
+type Money {
+    amount: String!
+    currency: String!
+}
+
+type OrderLine {
+    lineNo: Int!
+    sku: String!
+    quantity: Int!
+    unitPrice: String!
+    lineTotal: String!
+}
+
+type StatusChange {
+    fromStatus: String
+    toStatus: String!
+    changedAt: String!
+}
+
+enum OrderStatus {
+    PENDING
+    CONFIRMED
+    SHIPPED
+    DELIVERED
+    CANCELLED
+}

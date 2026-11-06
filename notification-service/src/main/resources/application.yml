@@ -1,0 +1,73 @@
+# notification-service configuration
+spring:
+  application:
+    name: notification-service
+  threads:
+    virtual:
+      enabled: true
+
+  # AWS Secrets Manager as a PROPERTY SOURCE: the JSON keys of secret /showcase/notification become
+  # properties (notification.sender-address...). "optional:" means startup continues if it's unreachable,
+  # falling back to the defaults below. Parameter Store works the same way (aws-parameterstore:).
+  config:
+    import: optional:aws-secretsmanager:/showcase/notification
+
+  rabbitmq:
+    host: localhost
+    username: showcase
+    password: ${RABBITMQ_PASSWORD:showcase}
+    listener:
+      simple:
+        prefetch: 10                    # unacked messages per consumer: fair dispatch + back-pressure
+        default-requeue-rejected: false # after retries: reject WITHOUT requeue, so the message goes to the DLX
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 1s
+          multiplier: 2.0
+        observation-enabled: true
+
+  # --- SPRING CLOUD AWS
+  cloud:
+    aws:
+      region:
+        static: eu-west-1
+      # LocalStack only. On AWS, REMOVE these and let the default credential chain use the IAM role.
+      credentials:
+        access-key: test
+        secret-key: test
+      endpoint: http://localhost:4566     # every AWS client points to LocalStack
+      s3:
+        path-style-access-enabled: true   # LocalStack needs path-style URLs (http://host/bucket/key)
+      sqs:
+        listener:
+          max-concurrent-messages: 10
+
+notification:
+  sender-address: no-reply@showcase.example
+  receipts-bucket: showcase-receipts
+  ops-alerts-topic: ops-alerts
+
+server:
+  port: 8083
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+---
+spring:
+  config:
+    activate:
+      on-profile: docker
+logging:
+  structured:
+    format:
+      console: ecs

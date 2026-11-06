@@ -1,0 +1,65 @@
+# =============================================================================
+#  AUTH SERVER: clients registered declaratively (Spring Boot auto-configuration)
+# =============================================================================
+spring:
+  application:
+    name: auth-server
+  security:
+    oauth2:
+      authorizationserver:
+        # The "iss" claim of every token. Resource servers must be configured with EXACTLY this value.
+        issuer: ${AUTH_ISSUER_URI:http://localhost:9000}
+        client:
+          # ------------------------------------------------------------------
+          # Browser SPA: public client, Authorization Code + PKCE, no secret
+          # ------------------------------------------------------------------
+          shop-web:
+            registration:
+              client-id: shop-web
+              client-authentication-methods: none          # public client: a secret in a browser isn't secret
+              authorization-grant-types: authorization_code, refresh_token
+              redirect-uris: http://localhost:3001/callback
+              scopes: openid, profile, orders.read, orders.write
+            require-proof-key: true                         # PKCE mandatory
+            require-authorization-consent: true
+            token:
+              access-token-time-to-live: 5m
+              refresh-token-time-to-live: 8h
+              reuse-refresh-tokens: false                   # refresh-token ROTATION: each use issues a new one
+          # ------------------------------------------------------------------
+          # Machine client: Client Credentials (service-to-service, curl demos)
+          # ------------------------------------------------------------------
+          machine-client:
+            registration:
+              client-id: machine-client
+              # {noop} = plain text, for the DEMO only. Real secrets: {bcrypt}... from a secret store.
+              client-secret: "{noop}machine-secret"
+              client-authentication-methods: client_secret_basic
+              authorization-grant-types: client_credentials
+              scopes: orders.read, orders.write
+            token:
+              access-token-time-to-live: 10m
+
+server:
+  port: 9000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+logging:
+  level:
+    org.springframework.security: INFO
+
+# PRODUCTION NOTES (see auth-server/README.md):
+#  - Signing keys: by default a NEW RSA key pair is generated at every startup, so tokens become invalid
+#    after a restart and replicas disagree. Provide a JWKSource bean backed by a keystore/KMS, and rotate
+#    keys (publish the new key in JWKS before signing with it).
+#  - Clients and authorizations live in memory: use JdbcRegisteredClientRepository and
+#    JdbcOAuth2AuthorizationService (or Redis) for multiple replicas.

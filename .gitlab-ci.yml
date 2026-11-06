@@ -1,0 +1,292 @@
+# =============================================================================
+#  GITLAB CI/CD PIPELINE
+# =============================================================================
+#  Flow (a DAG via "needs", so jobs start as soon as their inputs are ready, not when a whole stage ends):
+#
+#   validate ─► build ─┬─► test:unit ───────────┐
+#                      ├─► test:integration ────┼─► package:image (x5, parallel matrix) ─► security:trivy (x5)
+#                      └─► quality:sonar ───────┘                                           │
+#                                                         deploy:staging (auto, main) ◄─────┘
+#                                                         deploy:production (manual, tags only)
+#  Plus GitLab's managed security scanners (SAST, secret detection, dependency scanning) and a
+#  nightly OWASP Dependency-Check job.
+#
+#  Concepts explained inline: workflow rules (no duplicate pipelines), cache vs artifacts,
+#  Testcontainers with Docker-in-Docker, JUnit/coverage reports in MRs, parallel:matrix, OIDC
+#  keyless cloud auth (no long-lived AWS keys in CI variables), environments, resource_group (deploy
+#  locking), manual production gates. Full explanation: docs/18-gitlab-ci.md
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# WHEN does a pipeline run at all? Without this, pushing to a branch with an open MR creates TWO
+# pipelines (branch + MR). These rules keep exactly one.
+# -----------------------------------------------------------------------------
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never                                    # the MR pipeline covers this push
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/       # release tags such as v1.4.0
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  auto_cancel:
+    on_new_commit: interruptible                     # a new push cancels the outdated pipeline
+
+# GitLab-maintained security scanners. Their findings show up in the MR security widget.
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+  - template: Jobs/Dependency-Scanning.gitlab-ci.yml
+
+stages: [validate, build, test, quality, package, security, deploy]
+
+variables:
+  # Keep the Maven repository INSIDE the project dir: GitLab can only cache paths under $CI_PROJECT_DIR
+  MAVEN_OPTS: >-
+    -Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository
+    -Djava.awt.headless=true
+  MAVEN_CLI_OPTS: >-
+    --batch-mode --errors --fail-at-end --show-version --no-transfer-progress -Pci
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+  SERVICES: "auth-server api-gateway order-service inventory-service notification-service"
+
+default:
+  image: maven:3.9-eclipse-temurin-21
+  interruptible: true            # safe to cancel (deploy jobs override this to false)
+  retry:
+    max: 2
+    when: [runner_system_failure, stuck_or_timeout_failure]   # retry infrastructure flakes, never test failures
+  # CACHE = a best-effort speed-up shared between pipelines (dependencies).
+  # ARTIFACTS = guaranteed outputs passed to later jobs in the same pipeline (compiled classes, reports).
+  cache: &maven-cache
+    key:
+      files: [pom.xml]           # a new key whenever the root POM changes
+      prefix: maven
+    paths: [.m2/repository]
+    policy: pull                 # most jobs only READ the cache...
+
+# Hidden job (starts with a dot) used as a template through "extends"
+.maven-cache-writer:
+  cache:
+    <<: *maven-cache
+    policy: pull-push            # ...only the build job WRITES it, so jobs don't race to upload
+
+# =============================================================================
+# VALIDATE
+# =============================================================================
+validate:pom:
+  stage: validate
+  needs: []
+  script:
+    # Runs the maven-enforcer rules: Java/Maven versions, banned dependencies, duplicate declarations
+    - mvn $MAVEN_CLI_OPTS validate
+
+# =============================================================================
+# BUILD
+# =============================================================================
+build:compile:
+  stage: build
+  extends: .maven-cache-writer
+  needs: [validate:pom]
+  script:
+    - mvn $MAVEN_CLI_OPTS -T 1C test-compile
+  artifacts:
+    paths:
+      - "**/target/"
+    expire_in: 1 day
+
+# =============================================================================
+# TEST
+# =============================================================================
+test:unit:
+  stage: test
+  needs: [build:compile]
+  script:
+    # Surefire: *Test / *Tests classes. Pure unit tests + Spring slices; no Docker needed.
+    - mvn $MAVEN_CLI_OPTS -T 1C surefire:test
+  artifacts:
+    when: always                 # upload reports even (especially!) when tests fail
+    reports:
+      junit: "**/target/surefire-reports/TEST-*.xml"   # failed tests appear directly in the MR
+
+test:integration:
+  stage: test
+  needs: [build:compile]
+  # Testcontainers needs a Docker daemon: start Docker-in-Docker as a SERVICE container next to the job.
+  services:
+    - name: docker:27-dind
+      alias: docker
+      command: ["--tls=false"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    # Containers started by tests run INSIDE dind, so they're reachable at host "docker", not localhost
+    TESTCONTAINERS_HOST_OVERRIDE: docker
+    # Ryuk (Testcontainers' reaper) is unnecessary: the whole dind service dies with the job
+    TESTCONTAINERS_RYUK_DISABLED: "true"
+  script:
+    # verify = surefire + failsafe (*IT) + JaCoCo report + coverage gate (-Pci)
+    - mvn $MAVEN_CLI_OPTS verify
+  coverage: '/Total.*?([0-9]{1,3})%/'
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - "**/target/surefire-reports/TEST-*.xml"
+        - "**/target/failsafe-reports/TEST-*.xml"
+      coverage_report:
+        coverage_format: jacoco          # GitLab shows covered/uncovered lines in the MR diff
+        path: "**/target/site/jacoco/jacoco.xml"
+    paths:
+      - "**/target/site/jacoco/"
+      - "**/target/*.jar"
+    expire_in: 1 week
+
+# =============================================================================
+# QUALITY
+# =============================================================================
+quality:sonar:
+  stage: quality
+  needs: [test:integration]
+  rules:
+    - if: $SONAR_TOKEN                   # only when SonarQube is configured (a masked CI/CD variable)
+  variables:
+    GIT_DEPTH: "0"                       # full history: Sonar needs blame info for "new code" detection
+  script:
+    - >
+      mvn $MAVEN_CLI_OPTS sonar:sonar
+      -Dsonar.host.url=$SONAR_HOST_URL
+      -Dsonar.token=$SONAR_TOKEN
+      -Dsonar.qualitygate.wait=true
+  allow_failure: false                   # a failed quality gate blocks the merge
+
+# =============================================================================
+# PACKAGE: one image per service, built IN PARALLEL with parallel:matrix
+# =============================================================================
+package:image:
+  stage: package
+  image: docker:27
+  services:
+    - name: docker:27-dind
+      alias: docker
+  needs: [test:unit, test:integration]
+  parallel:
+    matrix:
+      - MODULE: [auth-server, api-gateway, order-service, inventory-service, notification-service]
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    IMAGE: $CI_REGISTRY_IMAGE/$MODULE
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+  before_script:
+    # --password-stdin keeps the token out of the process list and the job log
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker buildx create --use --driver docker-container
+  script:
+    # --cache-from/--cache-to type=registry: BuildKit layer cache stored IN the registry, so ephemeral CI
+    # runners still get cache hits.
+    # --provenance / --sbom: SLSA build provenance + a software bill of materials attached to the image
+    # (supply-chain security).
+    - >
+      docker buildx build
+      --build-arg MODULE=$MODULE
+      --build-arg VERSION=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}
+      --build-arg REVISION=$CI_COMMIT_SHA
+      --cache-from type=registry,ref=$IMAGE:buildcache
+      --cache-to type=registry,ref=$IMAGE:buildcache,mode=max
+      --provenance=true --sbom=true
+      --tag $IMAGE:$IMAGE_TAG
+      ${CI_COMMIT_TAG:+--tag $IMAGE:$CI_COMMIT_TAG}
+      --push .
+
+# =============================================================================
+# SECURITY
+# =============================================================================
+security:trivy:
+  stage: security
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  needs: [package:image]
+  parallel:
+    matrix:
+      - MODULE: [auth-server, api-gateway, order-service, inventory-service, notification-service]
+  variables:
+    TRIVY_USERNAME: $CI_REGISTRY_USER
+    TRIVY_PASSWORD: $CI_REGISTRY_PASSWORD
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+  script:
+    # Fail on fixable HIGH/CRITICAL vulnerabilities in OS packages AND Java jars inside the image
+    - trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed "$CI_REGISTRY_IMAGE/$MODULE:$IMAGE_TAG"
+
+security:owasp-nightly:
+  stage: security
+  needs: []
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"     # CI/CD → Schedules → nightly
+  script:
+    - mvn $MAVEN_CLI_OPTS -Psecurity verify -DskipTests -DnvdApiKey=$NVD_API_KEY
+  artifacts:
+    when: always
+    paths: [target/dependency-check-report.html]
+
+# =============================================================================
+# DEPLOY to Amazon EKS with OIDC: GitLab issues a short-lived signed JWT (id_tokens), and AWS STS
+# exchanges it for temporary credentials of an IAM role that trusts ONLY this project + branch.
+# No AWS access keys are stored anywhere.
+# =============================================================================
+.deploy:
+  stage: deploy
+  image: alpine/k8s:1.31.4                       # kubectl + kustomize + aws cli
+  interruptible: false                           # never cancel a half-finished deployment
+  id_tokens:
+    AWS_OIDC_TOKEN:
+      aud: sts.amazonaws.com
+  before_script:
+    - >
+      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s"
+      $(aws sts assume-role-with-web-identity
+      --role-arn "$AWS_DEPLOY_ROLE_ARN"
+      --role-session-name "gitlab-$CI_PIPELINE_ID"
+      --web-identity-token "$AWS_OIDC_TOKEN"
+      --duration-seconds 3600
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text))
+    - aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION"
+  script:
+    - cd deploy/k8s/overlays/$DEPLOY_ENV
+    # Pin every service to the immutable image built in THIS pipeline
+    - for s in $SERVICES; do kustomize edit set image "showcase/$s=$CI_REGISTRY_IMAGE/$s:$IMAGE_TAG"; done
+    - kubectl apply -k .
+    # Wait for the rolling update; a failed rollout fails the job (and the readiness probes gate traffic)
+    - for s in $SERVICES; do kubectl -n showcase-$DEPLOY_ENV rollout status deploy/$s --timeout=5m; done
+
+deploy:staging:
+  extends: .deploy
+  needs: [security:trivy]
+  variables:
+    DEPLOY_ENV: staging
+  environment:
+    name: staging
+    url: https://staging.showcase.example.com
+  resource_group: staging              # only ONE deployment to staging at a time
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+deploy:production:
+  extends: .deploy
+  needs: [deploy:staging]
+  variables:
+    DEPLOY_ENV: production
+  environment:
+    name: production
+    url: https://showcase.example.com
+  resource_group: production
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: manual                     # a human clicks "deploy" (protect the environment for approvals)
+  allow_failure: false

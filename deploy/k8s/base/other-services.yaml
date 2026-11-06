@@ -1,0 +1,107 @@
+# The remaining services follow the same pattern as order-service.yaml (see the comments there).
+# They're kept compact here to avoid repetition. In a real repo, a Helm chart or a kustomize component
+# would generate them from one template.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: inventory-service, labels: { app: inventory-service } }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: inventory-service } }
+  template:
+    metadata: { labels: { app: inventory-service } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: inventory-service
+          image: showcase/inventory-service
+          env: [{ name: SERVER_PORT, value: "8082" }, { name: SPRING_PROFILES_ACTIVE, value: kubernetes }]
+          ports: [{ name: http, containerPort: 8082 }, { name: grpc, containerPort: 9090 }]
+          resources: { requests: { cpu: "250m", memory: "768Mi" }, limits: { memory: "768Mi" } }
+          readinessProbe: { httpGet: { path: /actuator/health/readiness, port: http } }
+          livenessProbe: { httpGet: { path: /actuator/health/liveness, port: http } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: inventory-service }
+spec:
+  selector: { app: inventory-service }
+  ports: [{ name: http, port: 8082, targetPort: http }, { name: grpc, port: 9090, targetPort: grpc }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: notification-service, labels: { app: notification-service } }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: notification-service } }
+  template:
+    metadata: { labels: { app: notification-service } }
+    spec:
+      serviceAccountName: notification-service   # IRSA role allows s3:PutObject, ses:SendEmail, sqs:*, sns:Publish
+      securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+      containers:
+        - name: notification-service
+          image: showcase/notification-service
+          env: [{ name: SERVER_PORT, value: "8083" }, { name: SPRING_PROFILES_ACTIVE, value: kubernetes }]
+          ports: [{ name: http, containerPort: 8083 }]
+          resources: { requests: { cpu: "200m", memory: "512Mi" }, limits: { memory: "512Mi" } }
+          readinessProbe: { httpGet: { path: /actuator/health/readiness, port: http } }
+          livenessProbe: { httpGet: { path: /actuator/health/liveness, port: http } }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: notification-service
+  annotations: { eks.amazonaws.com/role-arn: "arn:aws:iam::123456789012:role/showcase-notification-service" }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: api-gateway, labels: { app: api-gateway } }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: api-gateway } }
+  template:
+    metadata: { labels: { app: api-gateway } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+      containers:
+        - name: api-gateway
+          image: showcase/api-gateway
+          env: [{ name: SERVER_PORT, value: "8080" }, { name: SPRING_PROFILES_ACTIVE, value: kubernetes }]
+          ports: [{ name: http, containerPort: 8080 }]
+          resources: { requests: { cpu: "500m", memory: "512Mi" }, limits: { memory: "512Mi" } }
+          readinessProbe: { httpGet: { path: /actuator/health/readiness, port: http } }
+          livenessProbe: { httpGet: { path: /actuator/health/liveness, port: http } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api-gateway }
+spec:
+  selector: { app: api-gateway }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: auth-server, labels: { app: auth-server } }
+spec:
+  replicas: 2   # needs SHARED signing keys and token storage when replicated (see auth-server README)
+  selector: { matchLabels: { app: auth-server } }
+  template:
+    metadata: { labels: { app: auth-server } }
+    spec:
+      securityContext: { runAsNonRoot: true, runAsUser: 10001 }
+      containers:
+        - name: auth-server
+          image: showcase/auth-server
+          env: [{ name: SERVER_PORT, value: "9000" }, { name: SPRING_PROFILES_ACTIVE, value: kubernetes }]
+          ports: [{ name: http, containerPort: 9000 }]
+          resources: { requests: { cpu: "250m", memory: "512Mi" }, limits: { memory: "512Mi" } }
+          readinessProbe: { httpGet: { path: /actuator/health/readiness, port: http } }
+          livenessProbe: { httpGet: { path: /actuator/health/liveness, port: http } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: auth-server }
+spec:
+  selector: { app: auth-server }
+  ports: [{ name: http, port: 9000, targetPort: http }]
